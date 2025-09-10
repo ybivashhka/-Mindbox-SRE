@@ -1,2 +1,1 @@
-﻿# Kubernetes webapp manifest
-
+Тестовое задание Mindbox на позицию SRE
