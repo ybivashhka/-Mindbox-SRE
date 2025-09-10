@@ -1,0 +1,476 @@
+# Namespace приложения. Здесь живут все объекты webapp; включаем строгую безопасность.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: webapp
+  labels:
+    # Включаем строгие Pod Security стандарты (restricted)
+    pod-security.kubernetes.io/enforce: restricted
+---
+# ServiceAccount. Токен не монтируем по умолчанию (меньше поверхность атаки).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: webapp-sa
+  namespace: webapp
+automountServiceAccountToken: false
+---
+# ConfigMap с конфигом. Удобно менять без пересборки образа.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webapp-config
+  namespace: webapp
+data:
+  APP_ENV: "production"
+  LOG_LEVEL: "info"
+  PORT: "8080" # Порт, который слушает контейнер
+---
+# Секреты приложения. В проде рекомендуем External Secrets/CSI; здесь — для примера.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: webapp-secrets
+  namespace: webapp
+type: Opaque
+stringData:
+  DATABASE_URL: "postgres://user:pass@db:5432/app" # Замените
+  REDIS_URL: "redis://redis:6379/0"                 # Замените/удалите, если не нужно
+  JWT_SECRET: "change-me"                           # Замените
+---
+# Deployment. Раскладываем поды по 3 зонам и разным нодам; бережно обновляемся.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapp
+  namespace: webapp
+  labels:
+    app.kubernetes.io/name: webapp
+    app.kubernetes.io/part-of: webapp
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/instance: prod
+    app.kubernetes.io/instance: prod
+    app.kubernetes.io/instance: prod
+    app.kubernetes.io/part-of: webapp
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: webapp
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: webapp
+    app.kubernetes.io/component: backend
+spec:
+  replicas: 4 # Держим базовый минимум днём; HPA/Cron поднимут при росте нагрузки
+  revisionHistoryLimit: 10
+  minReadySeconds: 15  # Даём поду стабильно побыть Ready, прежде чем катить дальше
+  progressDeadlineSeconds: 600  # Не позволяем rollout'ам зависать бесконечно
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Не снижаем доступность при обновлении; с 4 репликами и maxSurge=25% создастся 1 новый Pod.
+      maxUnavailable: 0
+      maxSurge: 25%
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: webapp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: webapp
+        app.kubernetes.io/part-of: webapp
+        app.kubernetes.io/component: backend
+    spec:
+      serviceAccountName: webapp-sa
+      priorityClassName: webapp-high-priority  # Приоритетнее фоновых воркеров при давлении
+      # Распределение по зонам и нодам: разница не более 1 Pod на домен.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule # Гарантируем равномерность по зонам (3 зоны)
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: webapp
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule # Раскладываем по нодам равномерно (5 нод)
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: webapp
+      affinity:
+        # Предпочтительно не класть несколько Pod на одну ноду (добавляет устойчивости)
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: webapp
+      terminationGracePeriodSeconds: 60  # Даем времени на корректное завершение и дрен
+      imagePullSecrets:
+        - name: regcred # Если образ в приватном реестре — укажите секрет; иначе удалите
+      securityContext:
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: webapp
+          image: ghcr.io/example/webapp:1.0.0 # Замените на ваш образ/тег
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh","-c","sleep 15"] # Даём kube-proxy/ingress убрать под из трафика
+          envFrom:
+            - configMapRef:
+                name: webapp-config
+            - secretRef:
+                name: webapp-secrets
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+          resources:
+            # Ресурсы: экономим базово, но разрешаем кратковременные CPU-пики на старте
+            requests:
+              cpu: "100m"      # Обычная нагрузка ~0.1 CPU
+              memory: "128Mi"  # Постоянное потребление ~128Mi
+            limits:
+              # CPU limit не задаём — чтобы не троттлить стартовые пики; память ограничиваем умеренно
+              memory: "256Mi"
+          # StartupProbe — даём 5–10с на инициализацию без убийства контейнера
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            failureThreshold: 10   # ~20с при periodSeconds=2: под 5–10с старта + запас
+            periodSeconds: 2
+          # Readiness — трафик только после готовности приложения и зависимостей
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 0  # С startupProbe readiness включится сразу после успешного старта
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # Liveness — перезапуск при зависаниях
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+# Сервис внутри кластера. Достаточно ClusterIP — Ingress проксирует на него.
+apiVersion: v1
+kind: Service
+metadata:
+  name: webapp
+  namespace: webapp
+  labels:
+    app.kubernetes.io/name: webapp
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: webapp
+    app.kubernetes.io/component: backend
+  ports:
+    - name: http
+      port: 80        # Порт, на который указывает Ingress
+      targetPort: 8080
+      appProtocol: http
+---
+# PriorityClass — webapp важнее фоновых задач, при давлении может вытеснить их.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: webapp-high-priority
+value: 1000000000
+globalDefault: false
+description: "High priority for webapp to preempt lower-priority pods during resource pressure"
+---
+# Ingress с TLS через cert-manager. NGINX перенаправляет весь HTTP на HTTPS.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: webapp
+  namespace: webapp
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod" # Замените при необходимости
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - webapp.example.com # Замените домен
+      secretName: webapp-tls # Создастся/обновится cert-manager'ом
+  rules:
+    - host: webapp.example.com # Замените домен
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: webapp
+                port:
+                  number: 80
+---
+# HPA v2 по CPU (нужен metrics-server). Рост быстрый, снижение плавное.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: webapp
+  namespace: webapp
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: webapp
+  minReplicas: 4 # Минимальный дневной базис
+  maxReplicas: 6  # +50% запас
+  # Поведение HPA для устойчивости: быстро растём, плавно снижаем, не флапаем
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 100   # Не более удвоения за 60с
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300  # 5 минут удерживаем перед снижением
+      selectPolicy: Min
+      policies:
+        - type: Percent
+          value: 50    # Снижение не более чем на 50% за 60с
+          periodSeconds: 60
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 85
+---
+# PDB — даже при обслуживании нод сохраняем минимум один pod приложения.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: webapp-pdb
+  namespace: webapp
+spec:
+  minAvailable: 1 # Минимальный профиль ресурсов; допускаем эвикции при сохранении хотя бы 1 pod
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: webapp
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: webapp-scaler
+  namespace: webapp
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: webapp-scaler
+  namespace: webapp
+rules:
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: webapp-scaler
+  namespace: webapp
+subjects:
+  - kind: ServiceAccount
+    name: webapp-scaler
+    namespace: webapp
+roleRef:
+  kind: Role
+  name: webapp-scaler
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: webapp-hpa-scale-down-night
+  namespace: webapp
+spec:
+  schedule: "0 1 * * *" # Ночью понижать (уточните часовой пояс/время UTC)
+  timeZone: "UTC" # Явно фиксируем TZ, если версия API поддерживает
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: webapp
+            app.kubernetes.io/component: scaler
+        spec:
+          serviceAccountName: webapp-scaler
+          restartPolicy: Never
+          containers:
+            - name: kubectl
+              image: bitnami/kubectl:1.28
+              imagePullPolicy: IfNotPresent
+              command: ["kubectl"]
+              args: ["patch", "hpa", "webapp", "-n", "webapp", "--type=merge", "-p", "{\"spec\":{\"minReplicas\":1}}"]
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: webapp-hpa-scale-up-day
+  namespace: webapp
+spec:
+  schedule: "0 8 * * *" # Днём поднимать до 4 (уточните часовой пояс/время UTC)
+  timeZone: "UTC" # Явно фиксируем TZ, если версия API поддерживает
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      ttlSecondsAfterFinished: 600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: webapp
+            app.kubernetes.io/component: scaler
+        spec:
+          serviceAccountName: webapp-scaler
+          restartPolicy: Never
+          containers:
+            - name: kubectl
+              image: bitnami/kubectl:1.28
+              imagePullPolicy: IfNotPresent
+              command: ["kubectl"]
+              args: ["patch", "hpa", "webapp", "-n", "webapp", "--type=merge", "-p", "{\"spec\":{\"minReplicas\":4}}"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-scaler
+  namespace: webapp
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: scaler
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+# Блок по умолчанию: запрещаем весь ingress/egress. Далее открываем нужное.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: webapp
+spec:
+  podSelector: {} # Все поды в namespace
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# Разрешаем входящий трафик только от Ingress Controller.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-from-ingress
+  namespace: webapp
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: webapp
+      app.kubernetes.io/component: backend
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        # Разрешаем из namespace контроллера. Уточните имя, если другой.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - port: http
+          protocol: TCP
+---
+# Разрешаем egress к DNS и наружу по HTTPS (минимально необходимое).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-dns-and-https
+  namespace: webapp
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: webapp
+  policyTypes: ["Egress"]
+  egress:
+    # DNS к CoreDNS (в kube-system). Помечен как k8s-app=kube-dns.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # HTTPS наружу. Уточните ipBlock/cidr до ваших внешних API, если возможно.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443

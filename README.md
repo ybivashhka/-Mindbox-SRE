@@ -1,0 +1,2 @@
+﻿# Kubernetes webapp manifest
+
